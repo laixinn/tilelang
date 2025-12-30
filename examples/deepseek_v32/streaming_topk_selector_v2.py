@@ -115,7 +115,7 @@ def tl_topk_impl(
     index_q_shape = [seq_len * heads, index_dim]
     index_k_shape = [seq_len_kv, index_dim]
     index_k_scale_shape = [seq_len_kv]
-    logits_shape = [seq_len, seq_len_kv]
+    logits_shape = [seq_len, topk]
 
     block_TOPK = topk + block_N
 
@@ -131,6 +131,7 @@ def tl_topk_impl(
         IndexK: T.Tensor(index_k_shape, dtype),  # type: ignore
         IndexKScale: T.Tensor(index_k_scale_shape, accum_dtype),  # type: ignore
         Logits: T.Tensor(logits_shape, accum_dtype),  # type: ignore
+        LogitsIdx: T.Tensor(logits_shape, index_dtype),  # type: ignore
         Weights: T.Tensor([seq_len, heads], accum_dtype),  # type: ignore
         CuSeqLenKS: T.Tensor([seq_len], index_dtype),  # type: ignore
         CuSeqLenKE: T.Tensor([seq_len], index_dtype),  # type: ignore
@@ -143,7 +144,6 @@ def tl_topk_impl(
             s_shared = T.alloc_fragment([block_N, block_Q * heads], accum_dtype)
             s_reshaped = T.reshape(s_shared, (block_N, block_Q, heads))
             logits = T.alloc_fragment([block_N, block_Q], accum_dtype)
-            logits_reshaped = T.reshape(logits, (block_Q, block_N))
             weights = T.alloc_fragment([block_Q, heads], accum_dtype)
 
             seq_len_i = bx * block_Q
@@ -154,14 +154,13 @@ def tl_topk_impl(
             cu_k_s_min = 2147483647
             cu_k_e_max = -2147483648
 
-            # about 3000 bx, cu_k_s_min = cu_k_s_max = seq_len_kv
             for bq_i in T.serial(block_Q):
                 cu_k_s_min = T.min(cu_k_s_min, T.min(CuSeqLenKS[seq_len_i + bq_i], seq_len_kv))
             for bq_i in T.serial(block_Q):
                 cu_k_e_max = T.max(cu_k_e_max, T.min(CuSeqLenKE[seq_len_i + bq_i], seq_len_kv))
 
             s_threshold_bin_id = T.alloc_shared([1], T.int32)
-            s_histogram = T.alloc_shared([RADIX + 1], T.int32)
+            s_histogram = T.alloc_shared([2, RADIX + 1], T.int32)
             s_num_input = T.alloc_shared([2], T.int32)
             s_input_idx = T.alloc_shared([2, SMEM_INPUT_SIZE], T.int32)
 
@@ -171,40 +170,32 @@ def tl_topk_impl(
             l_bin_id32 = T.alloc_var(T.int32)
             l_val = T.alloc_var(T.int32)
             l_start_pos = T.alloc_var(T.int32)
-            l_start_idx = T.alloc_var(T.int32)
-            l_end_idx = T.alloc_var(T.int32)
             l_out_pos = T.alloc_var(T.int32)
 
             l_new_topk = topk
-            l_start_idx = starts[bx]
-            l_end_idx = ends[bx]
 
             # sync
             tx = T.get_thread_binding()
-            logits_is_ready = T.alloc_barrier(arrive_count=512)
-            topk_is_done = T.alloc_barrier(arrive_count=512)
             copy_done = T.alloc_barrier(arrive_count=512)
             gemm_done = T.alloc_barrier(arrive_count=512)
 
-            # for bq_i, bn_i in T.Parallel(block_Q, block_N):
-            #     s_logits[bq_i, bn_i] = -T.infinity(accum_dtype)
-            #     s_index[bq_i, bn_i] = -1
+            T.fill(s_histogram[0, :], 0)
+            T.fill(s_num_input[0], 0)
+
+            nbn_i = T.alloc_var(T.int32)
+            pos = T.alloc_var(T.int32)
+            s_val = T.alloc_var(accum_dtype)
+            s_idx = T.alloc_var(index_dtype)
+            input_idx = T.alloc_var(T.int32)
 
             T.copy(IndexQ[seq_len_i * heads, 0], index_q_shared)
             T.copy(Weights[seq_len_i, 0], weights)
 
-            T.fill(s_histogram, 0)
-            T.fill(s_num_input[0], 0)
-
-            nbn_i = T.alloc_var(T.int32)
-
             # fill block_TOPK logits
-            fill_size = T.min(block_TOPK, cu_k_e_max - cu_k_s_min)
+            fill_size = T.min(topk, cu_k_e_max - cu_k_s_min)
             T.barrier_arrive(gemm_done)
 
-            # TODO: change to filling, followed by per-block topk compute
-            # now we assum filling stage is identical to the whole logits compute stage
-            for nbn_i in T.serial(T.ceildiv(cu_k_e_max - cu_k_s_min, block_N)):
+            for nbn_i in T.serial(T.ceildiv(fill_size, block_N)):
                 T.barrier_wait(gemm_done, nbn_i % 2)
 
                 T.copy(IndexK[cu_k_s_min + nbn_i * block_N, 0], index_k_shared)
@@ -237,376 +228,244 @@ def tl_topk_impl(
                     T.print(nbn_i, "pass gemm barrier")
 
                 for bn_i, bq_i, h_i in T.Parallel(block_N, block_Q, heads):
-                    s_reshaped[bn_i, bq_i, h_i] = (T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i]) * index_k_scale_fragment[
+                    s_reshaped[bn_i, bq_i, h_i] = (T.max(s_shared[bn_i, bq_i * heads + h_i], 0) * weights[bq_i, h_i]) * index_k_scale_fragment[
                         bn_i
                     ]
 
                 T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
 
-                for bq_i, bn_i in T.Parallel(block_Q, block_N):
-                    Logits[seq_len_i + bq_i, cu_k_s_min + nbn_i * block_N + bn_i] = logits[bn_i, bq_i]
-
-                for bq_i, bn_i in T.Parallel(block_Q, block_N):
-                    Logits[seq_len_i + bq_i, cu_k_s_min + nbn_i * block_N + bn_i] = logits[bn_i, bq_i]
-
-                # block_Q is restricted to 1
+                # update histogram for topk stage 1
                 for s in T.Parallel(block_N):
                     input_idx = cu_k_s_min + nbn_i * block_N + s
                     if input_idx < cu_k_e_max and input_idx >= cu_k_s_min and s < block_N:
                         inval_int16 = convert_to_uint16(logits[s, 0])
-                        T.atomic_add(s_histogram[inval_int16], 1)
+                        T.atomic_add(s_histogram[0, inval_int16], 1)
+
+                # store topk logits and index first
+                for s in T.Parallel(block_N):
+                    if input_idx < cu_k_e_max and input_idx >= cu_k_s_min and cu_k_s_min + nbn_i * block_N + s < fill_size:
+                        Logits[bx, cu_k_s_min + nbn_i * block_N + s] = logits[s, 0]
+                        LogitsIdx[bx, cu_k_s_min + nbn_i * block_N + s] = cu_k_s_min + nbn_i * block_N + s
 
             T.sync_threads(1, 512)
 
-            # cumsum
-            if tx < RADIX:
-                for i in T.serial(8):
-                    offset = 1 << i
-                    T.sync_threads(3, RADIX)
-                    if tx < RADIX - offset:
-                        l_val = s_histogram[tx] + s_histogram[tx + offset]
-                    T.sync_threads(3, RADIX)
-                    if tx < RADIX - offset:
-                        s_histogram[tx] = l_val
+            if cu_k_e_max - cu_k_s_min > topk:
+                # update topk for each logits block compute
+                cu_k_s_min = cu_k_s_min + fill_size
+                T.fill(s_histogram[1, :], 0)
 
-                # find threshold bin id
-                T.sync_threads(3, RADIX)
-                if s_histogram[tx] > l_new_topk and s_histogram[tx + 1] <= l_new_topk:
-                    s_threshold_bin_id[0] = tx
-            T.sync_threads(1, 512)
-            l_threshold_bin_id = s_threshold_bin_id[0]
-            l_new_topk = l_new_topk - s_histogram[l_threshold_bin_id + 1]
-            T.sync_threads(1, 512)
+                for nbn_i in T.serial(T.ceildiv(cu_k_e_max - cu_k_s_min, block_N)):
+                    T.fill(s_num_input[0], 0)
 
-            # collect all elements with exponent ≥ threshold
-            for s in T.serial(T.ceildiv(cu_k_e_max - cu_k_s_min, BLOCK_SIZE)):
-                T.sync_threads(1, 512)
-                input_idx = s * BLOCK_SIZE + tx
-                if input_idx < cu_k_e_max and input_idx >= cu_k_s_min and input_idx < seq_len_kv:
-                    bin_id = convert_to_uint16(Logits[bx, input_idx])
-                    l_bin_id32 = T.Cast(T.int32, bin_id)
-                    if l_bin_id32 > l_threshold_bin_id:
-                        # need a pos = T.atomic_add(s_histogram[bin_id32+1], 1)
-                        pos = T.atomic_add(s_histogram[l_bin_id32 + 1], 1, return_prev=True)
-                        # topk_index[bx, pos] = input_idx
-                        topk_index[bx * block_Q, pos] = input_idx
-                        topk_logits[bx * block_Q, pos] = Logits[bx, input_idx]
+                    # logits compute
+                    T.barrier_wait(gemm_done, nbn_i % 2)
 
-                    elif l_bin_id32 == l_threshold_bin_id and l_new_topk > 0:
-                        # pos = s_num_input[0]
-                        pos = T.atomic_add(s_num_input[0], 1, return_prev=True)
-                        s_input_idx[0, pos] = input_idx
+                    T.copy(IndexK[cu_k_s_min + nbn_i * block_N, 0], index_k_shared)
+                    T.copy(IndexKScale[cu_k_s_min + nbn_i * block_N], index_k_scale_fragment)
 
-            # stage 2: tail pass
-            for round in T.serial(4):
-                if l_new_topk <= 0:
-                    T.loop_break()
+                    if debug and bx == 0 and tx == 0:
+                        T.print(nbn_i, "copy done")
 
-                r_idx = round % 2
-                l_start_pos = topk - l_new_topk
+                    T.barrier_arrive(copy_done)
+                    T.barrier_wait(copy_done, nbn_i % 2)
 
-                T.sync_threads(1, 512)
-                T.fill(s_histogram, 0)
-                if tx == 0:
-                    s_num_input[r_idx ^ 1] = 0
-                T.sync_threads(1, 512)
+                    if debug and bx == 0 and tx == 0:
+                        T.print(nbn_i, "start gemm")
 
-                l_num_input = s_num_input[r_idx]
-                for s in T.serial(T.ceildiv(l_num_input, BLOCK_SIZE)):
-                    if s * BLOCK_SIZE + tx < l_num_input:
-                        l_bin_id32 = T.Cast(
-                            T.int32, ((convert_to_uint32(Logits[bx, s_input_idx[r_idx, s * BLOCK_SIZE + tx]]) >> (24 - round * 8)) & 0xFF)
-                        )
-                        T.atomic_add(s_histogram[l_bin_id32], 1)
-                T.sync_threads(1, 512)
+                    T.gemm(
+                        index_k_shared,
+                        index_q_shared,
+                        s_shared,
+                        transpose_B=True,
+                        clear_accum=True,
+                        policy=T.GemmWarpPolicy.FullRow,
+                    )
 
-                # cumsum
-                if tx < RADIX:
-                    for i in T.serial(8):
-                        offset = 1 << i
-                        T.sync_threads(3, RADIX)
-                        if tx < RADIX - offset:
-                            l_val = s_histogram[tx] + s_histogram[tx + offset]
-                        T.sync_threads(3, RADIX)
-                        if tx < RADIX - offset:
-                            s_histogram[tx] = l_val
+                    if debug and bx == 0 and tx == 0:
+                        T.print(nbn_i, "gemm done")
 
-                    # find threshold bin id
-                    T.sync_threads(3, RADIX)
-                    if s_histogram[tx] > l_new_topk and s_histogram[tx + 1] <= l_new_topk:
-                        s_threshold_bin_id[0] = tx
-                T.sync_threads(1, 512)
-                l_threshold_bin_id = s_threshold_bin_id[0]
-                l_new_topk = l_new_topk - s_histogram[l_threshold_bin_id + 1]
-                T.sync_threads(1, 512)
+                    T.barrier_arrive(gemm_done)
 
-                for s in T.serial(T.ceildiv(l_num_input, BLOCK_SIZE)):
+                    if debug and bx == 0 and tx == 0:
+                        T.print(nbn_i, "pass gemm barrier")
+
+                    for bn_i, bq_i, h_i in T.Parallel(block_N, block_Q, heads):
+                        s_reshaped[bn_i, bq_i, h_i] = (T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i]) * index_k_scale_fragment[
+                            bn_i
+                        ]
+
+                    T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
+
+                    # block_Q is restricted to 1
+                    for s in T.Parallel(block_N):
+                        input_idx = cu_k_s_min + nbn_i * block_N + s
+                        if input_idx < cu_k_e_max and input_idx >= cu_k_s_min and s < block_N:
+                            inval_int16 = convert_to_uint16(logits[s, 0])
+                            T.atomic_add(s_histogram[nbn_i % 2, inval_int16], 1)
+
+                    # maintain s_histogram for the next block
+                    T.copy(s_histogram[nbn_i % 2, :], s_histogram[(nbn_i % 2) ^ 1, :])
+
+                    # topk compute
+
+                    # cumsum
+                    s_threshold_bin_id[0] = -1
                     T.sync_threads(1, 512)
-                    if s * BLOCK_SIZE + tx < l_num_input:
-                        l_bin_id32 = T.Cast(
-                            T.int32, ((convert_to_uint32(Logits[bx, s_input_idx[r_idx, s * BLOCK_SIZE + tx]]) >> (24 - round * 8)) & 0xFF)
-                        )
-                        if l_bin_id32 > l_threshold_bin_id:
-                            pos = T.atomic_add(s_histogram[l_bin_id32 + 1], 1, return_prev=True) + l_start_pos
-                            # topk_index[bx, pos] = s_input_idx[r_idx, s * BLOCK_SIZE + tx]
-                            topk_index[bx * block_Q, pos] = s_input_idx[r_idx, s * BLOCK_SIZE + tx]
-                            topk_logits[bx * block_Q, pos] = Logits[bx, s_input_idx[r_idx, s * BLOCK_SIZE + tx]]
-                        elif l_bin_id32 == l_threshold_bin_id and l_new_topk > 0:
-                            if round == 3:
-                                l_out_pos = T.atomic_add(s_histogram[l_bin_id32 + 1], 1, return_prev=True) + l_start_pos
-                                if l_out_pos < topk:
-                                    # topk_index[bx, l_out_pos] = s_input_idx[r_idx, s * BLOCK_SIZE + tx]
-                                    topk_index[bx * block_Q, l_out_pos] = s_input_idx[r_idx, s * BLOCK_SIZE + tx]
-                                    topk_logits[bx * block_Q, l_out_pos] = Logits[bx, s_input_idx[r_idx, s * BLOCK_SIZE + tx]]
-                            else:
-                                pos = T.atomic_add(s_num_input[r_idx ^ 1], 1, return_prev=True)
-                                s_input_idx[r_idx ^ 1, pos] = s_input_idx[r_idx, s * BLOCK_SIZE + tx]
+                    if tx < RADIX:
+                        for i in T.serial(8):
+                            offset = 1 << i
+                            T.sync_threads(3, RADIX)
+                            if tx < RADIX - offset:
+                                l_val = s_histogram[nbn_i % 2, tx] + s_histogram[nbn_i % 2, tx + offset]
+                            T.sync_threads(3, RADIX)
+                            if tx < RADIX - offset:
+                                s_histogram[nbn_i % 2, tx] = l_val
 
-            # update topk for each logits block compute
-            for nbn_i in T.serial(T.ceildiv(cu_k_e_max - cu_k_s_min - fill_size, block_N)):
-                # logits compute
+                        # find threshold bin id
+                        T.sync_threads(3, RADIX)
+                        if s_histogram[nbn_i % 2, tx] > l_new_topk and s_histogram[nbn_i % 2, tx + 1] <= l_new_topk:
+                            s_threshold_bin_id[0] = tx
+                    T.sync_threads(1, 512)
+                    l_threshold_bin_id = s_threshold_bin_id[0]
+                    l_new_topk = l_new_topk - s_histogram[nbn_i % 2, l_threshold_bin_id + 1]
+                    T.sync_threads(1, 512)
 
-                T.barrier_wait(gemm_done, nbn_i % 2)
+                    if debug and bx == 0 and tx == 0 and l_threshold_bin_id < 0:
+                        T.print(l_threshold_bin_id, "stage 1l_threshold_bin_id < 0")
 
-                T.copy(IndexK[cu_k_s_min + nbn_i * block_N, 0], index_k_shared)
-                T.copy(IndexKScale[cu_k_s_min + nbn_i * block_N], index_k_scale_fragment)
+                    if debug and bx == 0 and tx == 0:
+                        T.print(l_new_topk, "l_new_topk 0")
 
-                if debug and bx == 0 and tx == 0:
-                    T.print(nbn_i, "copy done")
+                    # reset counter greater than topk to topk
+                    s_histogram[(nbn_i % 2) ^ 1, l_threshold_bin_id] = topk - s_histogram[nbn_i % 2, l_threshold_bin_id + 1]
+                    T.fill(s_histogram[(nbn_i % 2) ^ 1, 0 : l_threshold_bin_id], 0)
+                    if debug and bx == 0 and tx == 0:
+                        T.print(s_histogram[(nbn_i % 2) ^ 1, l_threshold_bin_id], "s_histogram[(nbn_i % 2) ^ 1, l_threshold_bin_id]")
 
-                T.barrier_arrive(copy_done)
-                T.barrier_wait(copy_done, nbn_i % 2)
+                    # collect previous topk elements with exponent ≥ threshold
+                    for s in T.serial(T.ceildiv(topk, BLOCK_SIZE)):
+                        T.sync_threads(1, 512)
+                        input_idx = s * BLOCK_SIZE + tx
+                        if input_idx < topk:
+                            bin_id = convert_to_uint16(Logits[bx, input_idx])
+                            l_bin_id32 = T.Cast(T.int32, bin_id)
+                            if l_bin_id32 > l_threshold_bin_id:
+                                # need a pos = T.atomic_add(s_histogram[bin_id32+1], 1)
+                                pos = T.atomic_add(s_histogram[nbn_i % 2, l_bin_id32 + 1], 1, return_prev=True)
+                                topk_index[bx, pos] = LogitsIdx[bx, input_idx]
+                                topk_logits[bx, pos] = Logits[bx, input_idx]
 
-                if debug and bx == 0 and tx == 0:
-                    T.print(nbn_i, "start gemm")
+                            elif l_bin_id32 == l_threshold_bin_id and l_new_topk > 0:
+                                pos = T.atomic_add(s_num_input[0], 1, return_prev=True)
+                                s_input_idx[0, pos] = input_idx
 
-                T.gemm(
-                    index_k_shared,
-                    index_q_shared,
-                    s_shared,
-                    transpose_B=True,
-                    clear_accum=True,
-                    policy=T.GemmWarpPolicy.FullRow,
-                )
+                    # collect current block elements with exponent ≥ threshold
+                    for s in T.Parallel(block_N):
+                        input_idx = cu_k_s_min + nbn_i * block_N + s
+                        if input_idx < cu_k_e_max and input_idx >= cu_k_s_min and s < block_N:
+                            inval_int16 = convert_to_uint16(logits[s, 0])
+                            l_bin_id32 = T.Cast(T.int32, inval_int16)
+                            if l_bin_id32 > l_threshold_bin_id:
+                                pos = T.atomic_add(s_histogram[nbn_i % 2, l_bin_id32 + 1], 1, return_prev=True)
+                                topk_index[bx, pos] = input_idx
+                                topk_logits[bx, pos] = logits[s, 0]
 
-                if debug and bx == 0 and tx == 0:
-                    T.print(nbn_i, "gemm done")
+                            elif l_bin_id32 == l_threshold_bin_id and l_new_topk > 0:
+                                pos = T.atomic_add(s_num_input[0], 1, return_prev=True)
+                                s_input_idx[0, pos] = input_idx
 
-                T.barrier_arrive(gemm_done)
+                    # stage 2: tail pass
+                    for round in T.serial(4):
+                        if l_new_topk <= 0:
+                            T.loop_break()
 
-                if debug and bx == 0 and tx == 0:
-                    T.print(nbn_i, "pass gemm barrier")
+                        r_idx = round % 2
+                        l_start_pos = topk - l_new_topk
 
-                for bn_i, bq_i, h_i in T.Parallel(block_N, block_Q, heads):
-                    s_reshaped[bn_i, bq_i, h_i] = (T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i]) * index_k_scale_fragment[
-                        bn_i
-                    ]
+                        T.sync_threads(1, 512)
+                        T.fill(s_histogram[nbn_i % 2, :], 0)
+                        if tx == 0:
+                            s_num_input[r_idx ^ 1] = 0
+                        T.sync_threads(1, 512)
 
-                T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
+                        if debug and bx == 0 and tx == 0:
+                            T.print(s_num_input[r_idx], "s_num_input[r_idx]")
 
-                # topk compute
+                        l_num_input = s_num_input[r_idx]
+                        for s in T.serial(T.ceildiv(l_num_input, BLOCK_SIZE)):
+                            T.sync_threads(1, 512)
+                            if s * BLOCK_SIZE + tx < l_num_input:
+                                input_idx = s_input_idx[r_idx, s * BLOCK_SIZE + tx]
+                                if input_idx < cu_k_s_min + nbn_i * block_N:
+                                    s_val = Logits[bx, input_idx]
+                                else:
+                                    s_val = logits[input_idx - cu_k_s_min - nbn_i * block_N, 0]
+                                l_bin_id32 = T.Cast(
+                                    T.int32, ((convert_to_uint32(s_val) >> (24 - round * 8)) & 0xFF)
+                                )
+                                T.atomic_add(s_histogram[nbn_i % 2, l_bin_id32], 1)
+                        T.sync_threads(1, 512)
 
-            # for nbn_i in T.serial(T.ceildiv(cu_k_e_max - cu_k_s_min, block_N)):
-            #     with T.ws(0, 1, 2, 3):
-            #         T.barrier_wait(topk_is_done, (nbn_i + 1) % 2)
-            #         if debug and bx == 0 and logits_tx == 0:
-            #             T.print(nbn_i, "doing logits compute")
-                    
-            #         # logits compute
-            #         T.copy(IndexK[cu_k_s_min + nbn_i * block_N, 0], index_k_shared)
-            #         T.copy(IndexKScale[cu_k_s_min + nbn_i * block_N], index_k_scale_fragment)
+                        # cumsum
+                        s_threshold_bin_id[0] = -1
+                        if tx < RADIX:
+                            for i in T.serial(8):
+                                offset = 1 << i
+                                T.sync_threads(3, RADIX)
+                                if tx < RADIX - offset:
+                                    l_val = s_histogram[nbn_i % 2, tx] + s_histogram[nbn_i % 2, tx + offset]
+                                T.sync_threads(3, RADIX)
+                                if tx < RADIX - offset:
+                                    s_histogram[nbn_i % 2, tx] = l_val
 
-            #         T.gemm(
-            #             index_k_shared,
-            #             index_q_shared,
-            #             s_shared,
-            #             transpose_B=True,
-            #             clear_accum=True,
-            #             policy=T.GemmWarpPolicy.FullCol,
-            #         )
+                            # find threshold bin id
+                            T.sync_threads(3, RADIX)
+                            if s_histogram[nbn_i % 2, tx] > l_new_topk and s_histogram[nbn_i % 2, tx + 1] <= l_new_topk:
+                                s_threshold_bin_id[0] = tx
+                        T.sync_threads(1, 512)
 
-            #         T.sync_threads(0, 512)
-            #         if debug and bx == 0 and logits_tx < 10 and nbn_i == 0:
-            #             T.print(s_shared[logits_tx, 0], "s_reshaped[logits_tx, 0]")
-            #         T.sync_threads(0, 512)
+                        l_threshold_bin_id = s_threshold_bin_id[0]
+                        l_new_topk = l_new_topk - s_histogram[nbn_i % 2, l_threshold_bin_id + 1]
+                        T.sync_threads(1, 512)
 
-            #         for bn_i, bq_i, h_i in T.Parallel(block_N, block_Q, heads):
-            #             s_reshaped[bn_i, bq_i, h_i] = (T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i]) * index_k_scale_fragment[
-            #                 bn_i
-            #             ]
+                        for s in T.serial(T.ceildiv(l_num_input, BLOCK_SIZE)):
+                            T.sync_threads(1, 512)
+                            if s * BLOCK_SIZE + tx < l_num_input:
+                                input_idx = s_input_idx[r_idx, s * BLOCK_SIZE + tx]
+                                if input_idx < cu_k_s_min + nbn_i * block_N:
+                                    s_val = Logits[bx, input_idx]
+                                    s_idx = LogitsIdx[bx, input_idx]
+                                else:
+                                    s_val = logits[input_idx - cu_k_s_min - nbn_i * block_N, 0]
+                                    s_idx = input_idx
 
-            #         T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
+                                l_bin_id32 = T.Cast(
+                                    T.int32, ((convert_to_uint32(s_val) >> (24 - round * 8)) & 0xFF)
+                                )
 
-            #         for bq_i, bn_i in T.Parallel(block_Q, block_N):
-            #             Logits[seq_len_i + bq_i, cu_k_s_min + nbn_i * block_N + bn_i] = logits[bn_i, bq_i]
+                                if l_bin_id32 > l_threshold_bin_id:
+                                    pos = T.atomic_add(s_histogram[nbn_i % 2, l_bin_id32 + 1], 1, return_prev=True) + l_start_pos
+                                    topk_logits[bx, pos] = s_val
+                                    topk_index[bx, pos] = s_idx
+                                elif l_bin_id32 == l_threshold_bin_id and l_new_topk > 0:
+                                    if round == 3:
+                                        l_out_pos = T.atomic_add(s_histogram[nbn_i % 2, l_bin_id32 + 1], 1, return_prev=True) + l_start_pos
+                                        if l_out_pos < topk:
+                                            topk_logits[bx, l_out_pos] = s_val
+                                            topk_index[bx, l_out_pos] = s_idx
+                                    else:
+                                        pos = T.atomic_add(s_num_input[r_idx ^ 1], 1, return_prev=True)
+                                        s_input_idx[r_idx ^ 1, pos] = s_input_idx[r_idx, s * BLOCK_SIZE + tx]
 
-            #         T.copy(T.reshape(logits, (block_Q, block_N)), s_logits[0, s_logits_offset[0]])
 
-            #         for bq_i, bn_i in T.Parallel(block_Q, block_N):
-            #             if s_logits_offset[0] + bn_i < block_TOPK:
-            #                 s_index[bq_i, s_logits_offset[0] + bn_i] = cu_k_s_min + nbn_i * block_N + bn_i
 
-            #         T.sync_threads(0, 512)
-            #         if logits_tx == 0:
-            #             T.atomic_add(s_logits_offset[0], block_N, return_prev=True)
-            #         T.sync_threads(0, 512)
-            #         if debug and bx == 0 and logits_tx == 1:
-            #             T.print(s_logits_offset[0], "logits updates s_logits_offset[0]")
+                    # dump topk to Logits
+                    T.copy(topk_index[bx, :], LogitsIdx[bx, :])
+                    T.copy(topk_logits[bx, :], Logits[bx, :])
+            else:
+                T.copy(LogitsIdx[bx, :], topk_index[bx, :])
+                T.copy(Logits[bx, :], topk_logits[bx, :])
 
-            #         if debug and bx == 0 and logits_tx == 0:
-            #             T.print(nbn_i, "logits compute done")
-            #         T.barrier_arrive(logits_is_ready)
-
-            #     with T.ws(4, 5, 6, 7):
-            #         T.barrier_wait(logits_is_ready, nbn_i % 2)
-
-            #         T.sync_threads(1, 512)
-            #         if debug and bx == 0 and topk_tx == 0:
-            #             T.print(s_logits_offset[0], "s_logits_offset[0]")
-                    
-            #         if s_logits_offset[0] >= block_TOPK:
-            #             if debug and bx == 0 and topk_tx == 0:
-            #                 T.print(nbn_i, "executing topk compute")
-            #             # topk compute
-
-            #             for bq_i in T.serial(block_Q):
-            #                 # stage 1: use 8bit to do quick topk
-            #                 T.fill(s_histogram, 0)
-            #                 T.fill(s_num_input[0], 0)
-
-            #                 T.sync_threads(1, 512)
-            #                 for s in T.serial(T.ceildiv(block_TOPK, BLOCK_SIZE)):
-            #                     input_idx = s * BLOCK_SIZE + topk_tx
-            #                     if input_idx < l_end_idx and input_idx >= l_start_idx and input_idx < block_TOPK:
-            #                         inval_int16 = convert_to_uint16(s_logits[0, input_idx])
-            #                         T.atomic_add(s_histogram[inval_int16], 1)
-            #                 T.sync_threads(1, 512)
-                            
-            #                 # cumsum
-            #                 if topk_tx < RADIX:
-            #                     for i in T.serial(8):
-            #                         offset = 1 << i
-            #                         T.sync_threads(3, RADIX)
-            #                         if topk_tx < RADIX - offset:
-            #                             l_val = s_histogram[topk_tx] + s_histogram[topk_tx + offset]
-            #                         T.sync_threads(3, RADIX)
-            #                         if topk_tx < RADIX - offset:
-            #                             s_histogram[topk_tx] = l_val
-
-            #                     # find threshold bin id
-            #                     T.sync_threads(3, RADIX)
-            #                     if s_histogram[topk_tx] > l_new_topk and s_histogram[topk_tx + 1] <= l_new_topk:
-            #                         s_threshold_bin_id[0] = topk_tx
-            #                 T.sync_threads(1, 512)
-            #                 l_threshold_bin_id = s_threshold_bin_id[0]
-            #                 l_new_topk = l_new_topk - s_histogram[l_threshold_bin_id + 1]
-            #                 T.sync_threads(1, 512)
-
-            #                 # collect all elements with exponent ≥ threshold
-            #                 for s in T.serial(T.ceildiv(block_TOPK, BLOCK_SIZE)):
-            #                     T.sync_threads(1, 512)
-            #                     input_idx = s * BLOCK_SIZE + topk_tx
-            #                     if input_idx < l_end_idx and input_idx >= l_start_idx and input_idx < seq_len_kv:
-            #                         bin_id = convert_to_uint16(s_logits[0, input_idx])
-            #                         l_bin_id32 = T.Cast(T.int32, bin_id)
-            #                         if l_bin_id32 > l_threshold_bin_id:
-            #                             # need a pos = T.atomic_add(s_histogram[bin_id32+1], 1)
-            #                             pos = T.atomic_add(s_histogram[l_bin_id32 + 1], 1, return_prev=True)
-            #                             # topk_index[bx, pos] = input_idx
-            #                             topk_index[bx * block_Q + bq_i, pos] = s_index[bq_i, input_idx]
-            #                             topk_logits[bx * block_Q + bq_i, pos] = s_logits[bq_i, input_idx]
-
-            #                         elif l_bin_id32 == l_threshold_bin_id and l_new_topk > 0:
-            #                             # pos = s_num_input[0]
-            #                             pos = T.atomic_add(s_num_input[0], 1, return_prev=True)
-            #                             s_input_idx[0, pos] = input_idx
-
-            #                 # stage 2: tail pass
-            #                 for round in T.serial(4):
-            #                     if l_new_topk <= 0:
-            #                         T.loop_break()
-
-            #                     r_idx = round % 2
-            #                     l_start_pos = topk - l_new_topk
-
-            #                     T.sync_threads(1, 512)
-            #                     T.fill(s_histogram, 0)
-            #                     if topk_tx == 0:
-            #                         s_num_input[r_idx ^ 1] = 0
-            #                     T.sync_threads(1, 512)
-
-            #                     l_num_input = s_num_input[r_idx]
-            #                     for s in T.serial(T.ceildiv(l_num_input, BLOCK_SIZE)):
-            #                         if s * BLOCK_SIZE + topk_tx < l_num_input:
-            #                             l_bin_id32 = T.Cast(
-            #                                 T.int32, ((convert_to_uint32(s_logits[0, s_input_idx[r_idx, s * BLOCK_SIZE + topk_tx]]) >> (24 - round * 8)) & 0xFF)
-            #                             )
-            #                             T.atomic_add(s_histogram[l_bin_id32], 1)
-            #                     T.sync_threads(1, 512)
-
-            #                     # cumsum
-            #                     if topk_tx < RADIX:
-            #                         for i in T.serial(8):
-            #                             offset = 1 << i
-            #                             T.sync_threads(3, RADIX)
-            #                             if topk_tx < RADIX - offset:
-            #                                 l_val = s_histogram[topk_tx] + s_histogram[topk_tx + offset]
-            #                             T.sync_threads(3, RADIX)
-            #                             if topk_tx < RADIX - offset:
-            #                                 s_histogram[topk_tx] = l_val
-
-            #                         # find threshold bin id
-            #                         T.sync_threads(3, RADIX)
-            #                         if s_histogram[topk_tx] > l_new_topk and s_histogram[topk_tx + 1] <= l_new_topk:
-            #                             s_threshold_bin_id[0] = topk_tx
-            #                     T.sync_threads(1, 512)
-            #                     l_threshold_bin_id = s_threshold_bin_id[0]
-            #                     l_new_topk = l_new_topk - s_histogram[l_threshold_bin_id + 1]
-            #                     T.sync_threads(1, 512)
-
-            #                     for s in T.serial(T.ceildiv(l_num_input, BLOCK_SIZE)):
-            #                         T.sync_threads(1, 512)
-            #                         if s * BLOCK_SIZE + topk_tx < l_num_input:
-            #                             l_bin_id32 = T.Cast(
-            #                                 T.int32, ((convert_to_uint32(s_logits[0, s_input_idx[r_idx, s * BLOCK_SIZE + topk_tx]]) >> (24 - round * 8)) & 0xFF)
-            #                             )
-            #                             if l_bin_id32 > l_threshold_bin_id:
-            #                                 pos = T.atomic_add(s_histogram[l_bin_id32 + 1], 1, return_prev=True) + l_start_pos
-            #                                 # topk_index[bx, pos] = s_input_idx[r_idx, s * BLOCK_SIZE + tx]
-            #                                 topk_index[bx * block_Q + bq_i, pos] = s_index[bq_i, s_input_idx[r_idx, s * BLOCK_SIZE + topk_tx]]
-            #                                 topk_logits[bx * block_Q + bq_i, pos] = s_logits[bq_i, s_input_idx[r_idx, s * BLOCK_SIZE + topk_tx]]
-            #                             elif l_bin_id32 == l_threshold_bin_id and l_new_topk > 0:
-            #                                 if round == 3:
-            #                                     l_out_pos = T.atomic_add(s_histogram[l_bin_id32 + 1], 1, return_prev=True) + l_start_pos
-            #                                     if l_out_pos < topk:
-            #                                         # topk_index[bx, l_out_pos] = s_input_idx[r_idx, s * BLOCK_SIZE + tx]
-            #                                         topk_index[bx * block_Q + bq_i, l_out_pos] = s_index[bq_i, s_input_idx[r_idx, s * BLOCK_SIZE + topk_tx]]
-            #                                         topk_logits[bx * block_Q + bq_i, l_out_pos] = s_logits[bq_i, s_input_idx[r_idx, s * BLOCK_SIZE + topk_tx]]
-            #                                 else:
-            #                                     pos = T.atomic_add(s_num_input[r_idx ^ 1], 1, return_prev=True)
-            #                                     s_input_idx[r_idx ^ 1, pos] = s_input_idx[r_idx, s * BLOCK_SIZE + topk_tx]
-
-            #                 T.copy(topk_index[bx * block_Q + bq_i, 0:topk], s_index[bq_i, 0:topk])
-            #                 T.copy(topk_logits[bx * block_Q + bq_i, 0:topk], s_logits[bq_i, 0:topk])
-                        
-            #             T.sync_threads(1, 512)
-            #             if topk_tx == 0:
-            #                 T.atomic_store(s_logits_offset[0], topk) # TODO: consider the case when topk > seq_len_kv
-            #             T.sync_threads(1, 512)
-            #             if bx == 0 and topk_tx == 0 and debug:
-            #                 T.print(s_logits_offset[0], "update s_logits_offset[0]")
-
-            #         elif nbn_i == (T.ceildiv(cu_k_e_max - cu_k_s_min, block_N) - 1):
-            #             if debug and bx == 0 and topk_tx == 0:
-            #                 T.print(nbn_i, "reach terminal nbn_i, copy index directly")
-
-            #             for bq_i in T.serial(block_Q):
-            #                 T.copy(topk_index[bx * block_Q + bq_i, 0:topk], s_index[bq_i, 0:topk])
-            #                 T.copy(topk_logits[bx * block_Q + bq_i, 0:topk], s_logits[bq_i, 0:topk])
-
-            #         if debug and bx == 0 and topk_tx == 0:
-            #             T.print(nbn_i, "barrier arrive topk_is_done")
-            #         T.barrier_arrive(topk_is_done)
 
     return tl_topk_kernel
 
@@ -620,7 +479,8 @@ def tl_topk(
 
     topk_indexes = torch.zeros(seq_len, topk, device=q.device, dtype=torch.int32)
     topk_logits = torch.empty([seq_len, topk], device=q.device, dtype=torch.float32)
-    logits = torch.empty([seq_len, seq_len_kv], device=q.device, dtype=torch.float32)
+    logits = torch.empty([seq_len, topk], device=q.device, dtype=torch.float32)
+    logits_idx = torch.empty([seq_len, topk], device=q.device, dtype=torch.int32)
 
     if kv_scales is None:
         kv_scales = torch.ones(seq_len_kv, device=q.device, dtype=torch.float32)
@@ -637,6 +497,7 @@ def tl_topk(
         kv,
         kv_scales,
         logits,
+        logits_idx,
         weights,
         cu_seqlen_ks,
         cu_seqlen_ke,
@@ -685,9 +546,9 @@ def test_topk_selector(S=4096, SKV=16384, H=32, HKV=1, D=64, kv_stride=1, topk=2
 
     print(topk_indices_ref)
 
-    # torch.testing.assert_close(original_logits, logits_ref)
-    acc_diff = validate_tensor_match(original_logits, logits_ref, tolerance=1e-14, tensor_name="logits", should_raise=False)
-    print(f"accuracy difference: {acc_diff}")
+    # # torch.testing.assert_close(original_logits, logits_ref)
+    # acc_diff = validate_tensor_match(original_logits, logits_ref, tolerance=1e-14, tensor_name="logits", should_raise=False)
+    # print(f"accuracy difference: {acc_diff}")
 
     # indexes_ref = fast_topk(input, topk)
     # print(indexes_ref)
@@ -705,6 +566,7 @@ def test_topk_selector(S=4096, SKV=16384, H=32, HKV=1, D=64, kv_stride=1, topk=2
             set_ref = set(ref_np)
             set_trt = set(trt_np)
             intersection = set_ref & set_trt
+            # print(set_ref - set_trt)
             print("selected/all:", len(intersection), "/", gt_len, "=", len(intersection) / gt_len)
 
     # Performance test with CUDA events
@@ -776,6 +638,5 @@ def run_regression_perf(batch=64, seq_len=32 * 1024, topk=2048):
 
 
 if __name__ == "__main__":
-    # TODO: will launch multiple kernels in loop
-    # TODO: 2048 has barrier bug
-    test_topk_selector(S=4096, SKV=4096)
+    test_topk_selector(S=2048+256, SKV=2048+256)
+    # test_topk_selector(S=16384, SKV=16384)
